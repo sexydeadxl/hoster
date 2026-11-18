@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: stark-host-bot
+    env: docker
+    dockerfilePath: Dockerfile
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        value: "5010778910"
+      - key: BOT_USERNAME
+        value: "@ganduhumabot"
+      - key: FORCE_CHANNEL
+        value: "@dailyb1ns"

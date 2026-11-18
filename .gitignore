@@ -1,0 +1,19 @@
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Persistent Data & User Uploads
+stark_data/
+upload_bots/
+mailboxes.json
+
+# Python & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.bak
+*.upload
+*.log
+git.txt
+ignore.py
