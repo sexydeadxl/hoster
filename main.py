@@ -2784,11 +2784,16 @@ def create_file_management_buttons(user_id, file_name, is_running=True):
     else:
         markup.row(
             types.InlineKeyboardButton("🚀 Start", callback_data=f'start_{user_id}_{fkey}'),
+            types.InlineKeyboardButton("🔄 Switch Server", callback_data=f'swp_{user_id}_{fkey}')
         )
     markup.row(
         types.InlineKeyboardButton("📋 Logs", callback_data=f'logs_{user_id}_{fkey}'),
         types.InlineKeyboardButton("🗑️ Delete", callback_data=f'delete_{user_id}_{fkey}')
     )
+    if is_running:
+        markup.row(
+            types.InlineKeyboardButton("🔄 Switch Server", callback_data=f'swp_{user_id}_{fkey}')
+        )
     if file_name.lower().endswith('.zip'):
         markup.row(
             types.InlineKeyboardButton("🎯 Run File", callback_data=f'ent_{user_id}_{fkey}'),
@@ -4215,6 +4220,8 @@ def handle_callbacks(call):
             handle_custom_entrypoint_callback(call)
         elif data.startswith('rdp_'):
             handle_redeploy_callback(call)
+        elif data.startswith('swp_'):
+            handle_switch_account_callback(call)
         elif data.startswith('rfsh_'):
             handle_refresh_logs_callback(call)
         elif data.startswith('blg_'):
@@ -4862,7 +4869,10 @@ def host_file_on_backend(user_id, file_path, file_name, message_obj, acc_row=Non
             types.InlineKeyboardButton("🏗️ Build Logs", callback_data=f"blg_{user_id}_{fkey}")
         )
         building_markup.row(
-            types.InlineKeyboardButton("📁 My Files", callback_data="manage_files"),
+            types.InlineKeyboardButton("🔄 Switch Server", callback_data=f"swp_{user_id}_{fkey}"),
+            types.InlineKeyboardButton("📁 My Files", callback_data="manage_files")
+        )
+        building_markup.row(
             types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_to_main")
         )
 
@@ -5154,11 +5164,18 @@ def _auto_provision_and_host(user_id, chat_id, msg_id):
             fkey = get_file_key(file_name)
             markup.row(
                 types.InlineKeyboardButton("🔄 Try Again", callback_data=f"start_{user_id}_{fkey}"),
-                types.InlineKeyboardButton("📞 Support", url=CHANNEL_URL)
+                types.InlineKeyboardButton("🔄 Switch Server", callback_data=f"swp_{user_id}_{fkey}")
+            )
+            markup.row(
+                types.InlineKeyboardButton("📞 Support", url=CHANNEL_URL),
+                types.InlineKeyboardButton("📁 My Files", callback_data="manage_files")
             )
         else:
-            markup.add(types.InlineKeyboardButton("📞 Support", url=CHANNEL_URL))
-        markup.add(types.InlineKeyboardButton("📁 My Files", callback_data="manage_files"))
+            markup.row(
+                types.InlineKeyboardButton("📞 Support", url=CHANNEL_URL),
+                types.InlineKeyboardButton("📁 My Files", callback_data="manage_files")
+            )
+        markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_to_main"))
         edit(err_card, markup=markup)
         return
 
@@ -5180,11 +5197,15 @@ def _auto_provision_and_host(user_id, chat_id, msg_id):
 
 
 def unbind_service_and_account_for_file(user_id, file_name):
-    """Clean up the service binding so the user can connect a fresh Railway email."""
+    """Clean up the service binding and account so the user switches to a fresh server."""
     try:
         stop_service(user_id, file_name)
     except Exception:
         pass
+
+    # Remove from bot_scripts in-memory dict
+    bot_scripts.pop(f"{user_id}_{file_name}", None)
+
     conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     c = conn.cursor()
     c.execute("select account_id from railway_services where user_id = ? and file_name = ?", (user_id, file_name))
@@ -5194,10 +5215,14 @@ def unbind_service_and_account_for_file(user_id, file_name):
         c.execute("delete from railway_services where user_id = ? and file_name = ?", (user_id, file_name))
         c.execute("delete from user_accounts where user_id = ? and account_id = ?", (user_id, acc_id))
         c.execute("update railway_accounts set status = 'expired' where account_id = ?", (acc_id,))
-    else:
-        # Also detach any free accounts associated with this user if none are attached to services
-        c.execute("""delete from user_accounts where user_id = ? and account_id not in 
-                     (select account_id from railway_services where user_id = ?)""", (user_id, user_id))
+
+    # Also find and expire any accounts for this user that are not bound to any remaining active service
+    c.execute("""select account_id from user_accounts where user_id = ? and account_id not in 
+                 (select account_id from railway_services where user_id = ?)""", (user_id, user_id))
+    for (acc_to_remove,) in c.fetchall():
+        c.execute("delete from user_accounts where user_id = ? and account_id = ?", (user_id, acc_to_remove))
+        c.execute("update railway_accounts set status = 'expired' where account_id = ?", (acc_to_remove,))
+
     conn.commit()
     conn.close()
 
@@ -5209,7 +5234,7 @@ def handle_switch_account_callback(call):
         file_name = resolve_file_key(fkey)
 
         if call.from_user.id != user_id and not is_admin(call.from_user.id):
-            bot.answer_callback_query(call.id, "❌ Permission denied!", show_alert=True)
+            _safe_answer_callback_query(call.id, "❌ Permission denied!", show_alert=True)
             return
 
         file_path = None
@@ -5219,18 +5244,34 @@ def handle_switch_account_callback(call):
                 break
 
         if not file_path or not os.path.exists(file_path):
-            bot.answer_callback_query(call.id, "❌ File not found!", show_alert=True)
+            _safe_answer_callback_query(call.id, "❌ File not found!", show_alert=True)
             return
 
-        unbind_service_and_account_for_file(user_id, file_name)
-        bot.answer_callback_query(call.id, "🔄 Switching to fresh cloud server...")
+        _safe_answer_callback_query(call.id, "🔄 Switching to fresh cloud server...")
 
-        # Reset any pending state and ask for new email
+        try:
+            bot.edit_message_text(
+                f"🔄 <b>SWITCHING CLOUD SERVER</b> 🔄\n"
+                f"{DIVIDER}\n"
+                f"📁 <b>Project:</b> <code>{_esc(file_name)}</code>\n"
+                f"⚙️ <b>Status:</b> <i>Reallocating fresh cloud server environment...</i>\n"
+                f"{DIVIDER}\n"
+                f"⏳ <i>Please wait while a new cloud slot is prepared...</i>",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode='HTML'
+            )
+        except Exception:
+            pass
+
+        unbind_service_and_account_for_file(user_id, file_name)
+
+        # Reset any pending state and begin fresh hosting
         pending_hosts.pop(user_id, None)
         begin_hosting(user_id, file_path, file_name, call.message)
     except Exception as e:
         logger.error(f"error in handle_switch_account_callback: {e}")
-        bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:100]}", show_alert=True)
+        _safe_answer_callback_query(call.id, f"❌ Error: {str(e)[:100]}", show_alert=True)
 
 def handle_start_file(call):
     try:
